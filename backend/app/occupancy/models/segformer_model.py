@@ -11,71 +11,111 @@ Future path:
 
 from __future__ import annotations
 
-import logging
-
+import cv2
+import torch
 import numpy as np
+import logging
 
 from app.occupancy.models.base_model import BaseOccupancyModel, PredictionResult
 
 logger = logging.getLogger(__name__)
 
-MODEL_VERSION = "segformer-b0-v1.0.0"
+MODEL_VERSION = "segformer-b0-finetuned-ade-v1.0.0"
+
+# ADE20K semantic classes mapping (partial) for warehouse-like approximation.
+# ADE20K doesn't have a specific "storage_material" class.
+# Common warehouse occupied objects in ADE20K:
+# 11: box, 32: shelf, 44: box, 15: cabinet, 67: desk, 5: tree (sometimes misclassified), etc.
+# Actually, ADE20K:
+# 0: wall, 1: building, 2: sky, 3: floor, 4: tree, 5: ceiling, 6: road, 7: bed, 8: window, 9: grass, 10: cabinet, 11: sidewalk, 12: person, 13: earth, 14: door, 15: table, 16: mountain, 17: plant, 18: curtain, 19: chair
+# Wait, let's treat anything that is NOT a structural empty space (floor, wall, ceiling, sky, road, window, door) as "occupied".
+ADE20K_EMPTY_CLASSES = {0, 1, 2, 3, 5, 6, 8, 11, 13, 14}
 
 
 class SegFormerOccupancyModel(BaseOccupancyModel):
     """
-    SegFormer-B0 wrapper for occupancy estimation.
-
-    MVP behaviour: brightness-ratio simulation constrained to [40, 80]%.
-    Production path: real HuggingFace SegFormer inference (see load_model).
+    SegFormer-B0 wrapper for occupancy estimation using a real pretrained model.
     """
 
-    def __init__(self, checkpoint: str = "nvidia/mit-b0") -> None:
+    # Class-level variables for Singleton pattern
+    _processor_instance = None
+    _model_instance = None
+    _is_loaded = False
+
+    def __init__(self, checkpoint: str = "nvidia/segformer-b0-finetuned-ade-512-512") -> None:
         self.checkpoint = checkpoint
-        self._model = None  # populated by load_model() when real weights available
-        logger.info(f"SegFormer: Initialized with checkpoint='{checkpoint}' (MVP simulation mode).")
+        logger.info(f"SegFormer: Initialized with checkpoint='{self.checkpoint}'.")
 
     def load_model(self) -> None:
         """
-        Placeholder for loading real SegFormer weights.
-
-        When the HuggingFace model is available, replace the pass with:
-            from transformers import SegformerForSemanticSegmentation, SegformerFeatureExtractor
-            self._feature_extractor = SegformerFeatureExtractor.from_pretrained(self.checkpoint)
-            self._model = SegformerForSemanticSegmentation.from_pretrained(self.checkpoint)
+        Lazy-loads the real SegFormer weights and processor exactly once.
         """
-        logger.info(
-            "SegFormer: load_model() called — real weights not loaded in MVP. "
-            "Will use brightness simulation."
-        )
+        if SegFormerOccupancyModel._is_loaded:
+            logger.info("SegFormer: Model already loaded (Singleton).")
+            return
+
+        logger.info(f"SegFormer: Loading model weights from '{self.checkpoint}'...")
+        t0 = self._time_ms()
+        
+        from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+        
+        # Load processor and model into class-level variables
+        SegFormerOccupancyModel._processor_instance = SegformerImageProcessor.from_pretrained(self.checkpoint)
+        SegFormerOccupancyModel._model_instance = SegformerForSemanticSegmentation.from_pretrained(self.checkpoint)
+        
+        # We only support CPU inference as per requirements
+        SegFormerOccupancyModel._model_instance.eval()
+        
+        SegFormerOccupancyModel._is_loaded = True
+        elapsed = self._time_ms() - t0
+        logger.info(f"SegFormer: Successfully loaded model and processor in {elapsed} ms.")
 
     def predict(self, frame: np.ndarray) -> PredictionResult:
         """
-        Estimate occupancy using a brightness-ratio heuristic.
-
-        Future flow (commented):
-            inputs  = self._feature_extractor(images=frame, return_tensors="pt")
-            outputs = self._model(**inputs)
-            logits  = outputs.logits
-            mask    = logits.argmax(dim=1).squeeze().numpy()
-            pct     = float((mask == STORAGE_CLASS_ID).sum() / mask.size * 100)
+        Estimate occupancy using real HuggingFace SegFormer inference.
         """
         t_start = self._time_ms()
         logger.info(f"SegFormer: Running inference on frame shape={frame.shape}.")
+        
+        if not self._is_loaded:
+            self.load_model()
+            
+        processor = SegFormerOccupancyModel._processor_instance
+        model = SegFormerOccupancyModel._model_instance
 
-        # ── MVP Simulation ──────────────────────────────────────────────────
-        gray = np.mean(frame, axis=2)
-        bright_pixels = int(np.sum(gray > 40))
-        total_pixels = int(gray.size)
-        raw_ratio = bright_pixels / total_pixels * 100.0
-
-        # Constrain to realistic warehouse occupancy window
-        occupancy = round(max(40.0, min(80.0, raw_ratio)), 2)
-
-        # Confidence: how many pixels were comfortably above the threshold
-        very_bright = int(np.sum(gray > 80))
-        confidence = round(min(1.0, very_bright / max(total_pixels, 1) + 0.6), 4)
-        # ────────────────────────────────────────────────────────────────────
+        # 1. Convert OpenCV BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # 2. Preprocess
+        inputs = processor(images=rgb_frame, return_tensors="pt")
+        
+        # 3. Model Inference (no gradients needed)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            
+        # 4. Post-process to get segmentation map
+        logits = outputs.logits
+        # Rescale logits to original image size
+        upsampled_logits = torch.nn.functional.interpolate(
+            logits,
+            size=rgb_frame.shape[:2],
+            mode="bilinear",
+            align_corners=False,
+        )
+        # Argmax to get class predictions
+        segmentation_map = upsampled_logits.argmax(dim=1).squeeze().cpu().numpy()
+        
+        # 5. Calculate Occupancy %
+        total_pixels = segmentation_map.size
+        # Create a mask of empty space classes
+        empty_mask = np.isin(segmentation_map, list(ADE20K_EMPTY_CLASSES))
+        empty_pixels = empty_mask.sum()
+        occupied_pixels = total_pixels - empty_pixels
+        
+        occupancy = round((occupied_pixels / max(total_pixels, 1)) * 100.0, 2)
+        
+        # 6. Calculate Confidence (for now, default to a high value since we are using a real model but don't have true softmax entropy without more computation)
+        confidence = 0.9000
 
         elapsed_ms = self._time_ms() - t_start
         logger.info(
@@ -89,9 +129,11 @@ class SegFormerOccupancyModel(BaseOccupancyModel):
             processing_time_ms=elapsed_ms,
             metadata={
                 "checkpoint": self.checkpoint,
-                "bright_pixels": bright_pixels,
-                "total_pixels": total_pixels,
-                "mode": "brightness_simulation",
+                "total_pixels": int(total_pixels),
+                "occupied_pixels": int(occupied_pixels),
+                "empty_pixels": int(empty_pixels),
+                "mode": "real_inference",
+                "segmentation_map_shape": segmentation_map.shape,
             },
         )
 
